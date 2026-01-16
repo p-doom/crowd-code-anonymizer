@@ -2,6 +2,7 @@
 
 import sys
 import json
+import time
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -10,6 +11,115 @@ import click
 from .redactor import Redactor, Redaction
 from .csv_parser import CSVRow
 from .report import print_summary, write_report
+
+
+def _format_time(seconds: float) -> str:
+    """Format seconds into human-readable time."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    elif seconds < 3600:
+        minutes = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{minutes}m {secs}s"
+    else:
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        return f"{hours}h {minutes}m"
+
+
+class ProgressDisplay:
+    """Manages progress display for the CLI."""
+    
+    def __init__(self, quiet: bool = False):
+        self.quiet = quiet
+        self.current_file: str | None = None
+        self.file_num = 0
+        self.total_files = 0
+        self.start_time = time.time()
+        self.file_start_time = time.time()
+        self.total_rows_processed = 0
+        self.total_redactions_found = 0
+    
+    def start_file(self, file_num: int, total_files: int, file_path: Path) -> None:
+        """Called when starting to process a new file."""
+        if self.quiet:
+            return
+        self.file_num = file_num
+        self.total_files = total_files
+        self.current_file = str(file_path.name)
+        self.file_start_time = time.time()
+        
+        click.echo(f"\n[{file_num}/{total_files}] {file_path.name}")
+    
+    def update_progress(
+        self,
+        current: int,
+        total: int,
+        message: str,
+        **kwargs,
+    ) -> None:
+        """Called to update progress within a file."""
+        if self.quiet:
+            return
+        
+        rows_per_sec = kwargs.get('rows_per_sec', 0)
+        eta_seconds = kwargs.get('eta_seconds', 0)
+        redactions_found = kwargs.get('redactions_found', 0)
+        
+        # Calculate percentage
+        pct = (current / total * 100) if total > 0 else 0
+        
+        # Create progress bar
+        bar_width = 30
+        filled = int(bar_width * current / total) if total > 0 else 0
+        bar = '█' * filled + '░' * (bar_width - filled)
+        
+        # Format ETA
+        eta_str = _format_time(eta_seconds) if eta_seconds > 0 else "--"
+        
+        # Print progress line (overwrite previous)
+        status = (
+            f"\r  [{bar}] {pct:5.1f}% | "
+            f"{current:,}/{total:,} rows | "
+            f"{rows_per_sec:,.0f} rows/s | "
+            f"ETA: {eta_str} | "
+            f"Redactions: {redactions_found:,}"
+        )
+        click.echo(status, nl=False)
+        
+        # Track totals
+        self.total_rows_processed = current
+        self.total_redactions_found = redactions_found
+    
+    def finish_file(self, result) -> None:
+        """Called when finished processing a file."""
+        if self.quiet:
+            return
+        
+        elapsed = time.time() - self.file_start_time
+        click.echo()  # New line after progress bar
+        click.echo(
+            f"  ✓ {result.total_rows:,} rows, "
+            f"{result.modified_rows:,} modified, "
+            f"{result.total_redactions:,} redactions "
+            f"({_format_time(elapsed)})"
+        )
+    
+    def finish_all(self, results: list) -> None:
+        """Called when all processing is complete."""
+        if self.quiet:
+            return
+        
+        total_elapsed = time.time() - self.start_time
+        total_rows = sum(r.total_rows for r in results)
+        total_redactions = sum(r.total_redactions for r in results)
+        
+        click.echo()
+        click.echo("=" * 60)
+        click.echo(f"Completed {len(results)} file(s) in {_format_time(total_elapsed)}")
+        click.echo(f"Total: {total_rows:,} rows, {total_redactions:,} redactions")
+        if total_elapsed > 0:
+            click.echo(f"Average: {total_rows / total_elapsed:,.0f} rows/second")
 
 
 def _similarity_ratio(s1: str, s2: str) -> float:
@@ -428,11 +538,16 @@ def main(
                     checkpoint=True,
                 )
             else:
+                progress = ProgressDisplay(quiet=quiet)
+                progress.start_file(1, 1, input_path)
+                
                 result = redactor.redact_csv_file(
                     input_path,
                     output_path=output,
                     dry_run=dry_run,
+                    progress_callback=progress.update_progress,
                 )
+                progress.finish_file(result)
             results.append(result)
             
             if verbose:
@@ -521,12 +636,33 @@ def main(
                     checkpoint=True,
                 )
             else:
-                results = redactor.redact_directory(
-                    input_path,
-                    output_directory=output,
-                    recursive=recursive,
-                    dry_run=dry_run,
-                )
+                from .csv_parser import find_csv_files
+                
+                progress = ProgressDisplay(quiet=quiet)
+                csv_files = find_csv_files(input_path, recursive=recursive)
+                total_files = len(csv_files)
+                results = []
+                
+                for file_num, csv_file in enumerate(csv_files, 1):
+                    progress.start_file(file_num, total_files, csv_file)
+                    
+                    if output:
+                        relative = csv_file.relative_to(input_path)
+                        output_path = output / relative.with_suffix('.anonymized.csv')
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                    else:
+                        output_path = None
+                    
+                    result = redactor.redact_csv_file(
+                        csv_file,
+                        output_path=output_path,
+                        dry_run=dry_run,
+                        progress_callback=progress.update_progress,
+                    )
+                    results.append(result)
+                    progress.finish_file(result)
+                
+                progress.finish_all(results)
             
             if not results:
                 click.echo("No CSV files found.", err=True)

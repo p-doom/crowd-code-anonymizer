@@ -2,9 +2,31 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Protocol
+import time
 
 from .csv_parser import CSVRow, find_csv_files, parse_csv_file, write_csv_file
+
+
+class ProgressCallback(Protocol):
+    """Protocol for progress reporting callbacks."""
+    
+    def __call__(
+        self,
+        current: int,
+        total: int,
+        message: str,
+        **kwargs,
+    ) -> None:
+        """Report progress.
+        
+        Args:
+            current: Current item number
+            total: Total number of items
+            message: Status message
+            **kwargs: Additional info (e.g., file_path, rows_per_sec, etc.)
+        """
+        ...
 from .detectors import SecretsDetector, PIIDetector, CustomDetector
 from .detectors.secrets import SecretFinding
 from .detectors.pii import PIIFinding
@@ -246,6 +268,7 @@ class Redactor:
         output_path: Path | None = None,
         dry_run: bool = False,
         batch_size: int = 64,
+        progress_callback: ProgressCallback | None = None,
     ) -> FileRedactionResult:
         """Redact a CSV file using batch processing for GPU efficiency.
         
@@ -254,6 +277,7 @@ class Redactor:
             output_path: Path for output (if None, generates based on input)
             dry_run: If True, don't write output file
             batch_size: Number of rows to process at once (higher = better GPU utilization)
+            progress_callback: Optional callback for progress reporting
             
         Returns:
             FileRedactionResult with details of all redactions
@@ -264,11 +288,18 @@ class Redactor:
         rows: list[CSVRow] = list(parse_csv_file(input_path))
         row_results: list[RowRedactionResult] = []
         modified_texts: dict[int, str] = {}
+        total_rows = len(rows)
+        total_redactions = 0
+        
+        start_time = time.time()
+        last_progress_time = start_time
         
         # Process rows in batches for GPU efficiency
         for i in range(0, len(rows), batch_size):
             batch_rows = rows[i:i + batch_size]
             batch_texts = [row.text for row in batch_rows]
+            batch_num = i // batch_size + 1
+            total_batches = (total_rows + batch_size - 1) // batch_size
             
             # Batch detect PII (main bottleneck - benefits most from batching)
             pii_findings_batch = self.pii_detector.detect_batch(batch_texts)
@@ -295,9 +326,27 @@ class Redactor:
                     redactions=redactions,
                 )
                 row_results.append(result)
+                total_redactions += len(redactions)
                 
                 if result.was_modified:
                     modified_texts[row.row_index] = result.redacted_text
+            
+            # Report progress after each batch
+            if progress_callback:
+                current_row = min(i + batch_size, total_rows)
+                elapsed = time.time() - start_time
+                rows_per_sec = current_row / elapsed if elapsed > 0 else 0
+                eta_seconds = (total_rows - current_row) / rows_per_sec if rows_per_sec > 0 else 0
+                
+                progress_callback(
+                    current=current_row,
+                    total=total_rows,
+                    message=f"Batch {batch_num}/{total_batches}",
+                    file_path=str(input_path),
+                    rows_per_sec=rows_per_sec,
+                    eta_seconds=eta_seconds,
+                    redactions_found=total_redactions,
+                )
         
         # Write output file unless dry run
         actual_output: Path | None = None
@@ -324,6 +373,9 @@ class Redactor:
         output_directory: Path | None = None,
         recursive: bool = False,
         dry_run: bool = False,
+        batch_size: int = 64,
+        progress_callback: ProgressCallback | None = None,
+        file_callback: Callable[[int, int, Path], None] | None = None,
     ) -> list[FileRedactionResult]:
         """Redact all CSV files in a directory.
         
@@ -332,14 +384,21 @@ class Redactor:
             output_directory: Directory for output files (if None, uses same directory)
             recursive: If True, process subdirectories
             dry_run: If True, don't write output files
+            batch_size: Batch size for GPU processing
+            progress_callback: Callback for row-level progress
+            file_callback: Callback when starting a new file (file_num, total_files, path)
             
         Returns:
             List of FileRedactionResult for each file
         """
         csv_files = find_csv_files(directory, recursive=recursive)
         results: list[FileRedactionResult] = []
+        total_files = len(csv_files)
         
-        for csv_file in csv_files:
+        for file_num, csv_file in enumerate(csv_files, 1):
+            if file_callback:
+                file_callback(file_num, total_files, csv_file)
+            
             if output_directory:
                 # Preserve relative structure in output directory
                 relative = csv_file.relative_to(directory)
@@ -348,7 +407,13 @@ class Redactor:
             else:
                 output_path = None
             
-            result = self.redact_csv_file(csv_file, output_path, dry_run=dry_run)
+            result = self.redact_csv_file(
+                csv_file, 
+                output_path, 
+                dry_run=dry_run,
+                batch_size=batch_size,
+                progress_callback=progress_callback,
+            )
             results.append(result)
         
         return results
